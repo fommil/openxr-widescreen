@@ -2,3 +2,5 @@
 packages/*
 x64/*
 *.vcxproj.user
+[Dd]ebug/
+[Rr]elease/

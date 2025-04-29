@@ -12,62 +12,32 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// This OpenXR layer demonstrates how to intercept the OpenXR calls to xrLocateViews() in order to alter the FOV based on per-application settings.
-
 #include "pch.h"
+#include <algorithm>
+#include <cmath>
 
 namespace {
-    const std::string LayerName = "XR_APILAYER_NOVENDOR_fov_modifier";
+    const std::string LayerName = "XR_APILAYER_fommil_widescreen";
 
-    // The path where the DLL loads config files and stores logs.
     std::string dllHome;
 
-    // The file logger.
     std::ofstream logStream;
+
+    // we only enable ourselves for specific (simracing) titles
+    // this has to be considered for every function, because
+    // downstream of us might cache references.
+    bool enabled = false;
+
+    // we might want to make this configurable in the future
+    constexpr double kTargetAspect = 16.0f / 9.0f;
 
     // Function pointers to interact with the next layers and/or the OpenXR runtime.
     PFN_xrGetInstanceProcAddr nextXrGetInstanceProcAddr = nullptr;
     PFN_xrLocateViews nextXrLocateViews = nullptr;
+    PFN_xrEnumerateViewConfigurationViews nextXrEnumerateViewConfigurationViews = nullptr;
 
     void Log(const char* fmt, ...);
 
-    struct {
-        bool loaded;
-
-        float leftAngleUp;
-        float leftAngleDown;
-        float leftAngleLeft;
-        float leftAngleRight;
-        float rightAngleUp;
-        float rightAngleDown;
-        float rightAngleLeft;
-        float rightAngleRight;
-        
-        void Dump()
-        {
-            if (loaded)
-            {
-                Log("Using FOV for left %.3f %.3f %.3f %.3f and right %.3f %.3f %.3f %.3f\n",
-                    leftAngleUp, leftAngleDown, leftAngleLeft, leftAngleRight,
-                    rightAngleUp, rightAngleDown, rightAngleLeft, rightAngleRight);
-            }
-        }
-
-        void Reset()
-        {
-            loaded = false;
-            leftAngleUp = 1.0f;
-            leftAngleDown = 1.0f;
-            leftAngleLeft = 1.0f;
-            leftAngleRight = 1.0f;
-            rightAngleUp = 1.0f;
-            rightAngleDown = 1.0f;
-            rightAngleLeft = 1.0f;
-            rightAngleRight = 1.0f;
-        }
-    } config;
-
-    // Utility logging function.
     void InternalLog(const char* fmt, va_list va)
     {
         char buf[1024];
@@ -80,7 +50,6 @@ namespace {
         }
     }
 
-    // General logging function.
     void Log(const char* fmt, ...)
     {
         va_list va;
@@ -89,7 +58,6 @@ namespace {
         va_end(va);
     }
 
-    // Debug logging function. Can make things very slow (only enabled on Debug builds).
     void DebugLog(const char* fmt, ...)
     {
 #ifdef _DEBUG
@@ -100,86 +68,115 @@ namespace {
 #endif
     }
 
-    // Load configuration for our layer.
-    bool LoadConfiguration(const std::string configName)
+    // ---------------------------------------------------------------------------
+    // ClampVerticalFov – symmetric 16:9 crop (equal cut top & bottom)
+    // ---------------------------------------------------------------------------
+    // - works entirely in double precision to minimise rounding
+    // - first tries an equal-delta trim; if either side can’t spare the delta
+    //   it falls back to proportional scaling (rare on real headsets)
+    // ---------------------------------------------------------------------------
+    static void ClampVerticalFov(XrFovf& fov)
     {
-        if (configName.empty())
+        using d = double;
+
+        d tanL = std::tan(static_cast<d>(fov.angleLeft));   // −
+        d tanR = std::tan(static_cast<d>(fov.angleRight));  // +
+        d tanU = std::tan(static_cast<d>(fov.angleUp));     // +
+        d tanD = std::tan(static_cast<d>(fov.angleDown));   // −
+
+        d widthTan = std::fabs(tanL) + std::fabs(tanR);
+        d heightTan = std::fabs(tanU) + std::fabs(tanD);
+        d aspect = widthTan / heightTan;
+
+        if (aspect >= kTargetAspect)
+            return;
+
+        d desiredHeightTan = widthTan / kTargetAspect;
+        d delta = (heightTan - desiredHeightTan) * 0.5;  // cut from each side
+
+        // Can both sides spare that much?
+        d maxTrim = std::fabs(tanU) < std::fabs(tanD) ? std::fabs(tanU) : std::fabs(tanD);
+
+        if (delta <= maxTrim)
         {
-            return false;
+            tanU -= delta;
+            tanD += delta;
+        }
+        else
+        {
+            d scale = desiredHeightTan / heightTan;
+            tanU *= scale;
+            tanD *= scale;
+            delta = 0.0;
         }
 
-        std::ifstream configFile(std::filesystem::path(dllHome) / std::filesystem::path(configName + ".cfg"));
-        if (configFile.is_open())
-        {
-            Log("Loading config for \"%s\"\n", configName.c_str());
+        // Back to angles (single float conversion)
+        fov.angleUp = static_cast<float>(std::atan(tanU));
+        fov.angleDown = static_cast<float>(std::atan(tanD));
 
-            unsigned int lineNumber = 0;
-            std::string line;
-            while (std::getline(configFile, line))
-            {
-                lineNumber++;
-                try
-                {
-                    // TODO: Handle comments, white spaces, blank lines...
-                    const auto offset = line.find('=');
-                    if (offset != std::string::npos)
-                    {
-                        const std::string name = line.substr(0, offset);
-                        const float value = std::stof(line.substr(offset + 1));
+#ifdef _DEBUG
+        d newAspect = widthTan / (std::fabs(tanU) + std::fabs(tanD));
+        DebugLog("FOV sym-crop: aspect %.6f → %.6f  delta %.6f%s\n",
+            aspect, newAspect, delta,
+            delta == 0.0 ? " (scaled)" : "");
+#endif
+    }
 
-                        if (name == "left.up")
-                        {
-                            config.leftAngleUp = value;
-                        }
-                        else if (name == "left.down")
-                        {
-                            config.leftAngleDown = value;
-                        }
-                        else if (name == "left.left")
-                        {
-                            config.leftAngleLeft = value;
-                        }
-                        else if (name == "left.right")
-                        {
-                            config.leftAngleRight = value;
-                        }
-                        else if (name == "right.up")
-                        {
-                            config.rightAngleUp = value;
-                        }
-                        else if (name == "right.down")
-                        {
-                            config.rightAngleDown = value;
-                        }
-                        else if (name == "right.left")
-                        {
-                            config.rightAngleLeft = value;
-                        }
-                        else if (name == "right.right")
-                        {
-                            config.rightAngleRight = value;
-                        }
-                    }
-                }
-                catch (...)
-                {
-                    Log("Error parsing L%u\n", lineNumber);
+    XRAPI_ATTR XrResult XRAPI_CALL fommil_widescreen_xrEnumerateViewConfigurationViews(
+        XrInstance               instance,
+        XrSystemId               systemId,
+        XrViewConfigurationType  viewConfigurationType,
+        uint32_t                 viewCapacityInput,
+        uint32_t*                viewCountOutput,
+        XrViewConfigurationView* views)
+    {
+        if (enabled) {
+            DebugLog("--> fommil_widescreen_xrEnumerateViewConfigurationViews\n");
+        }
+
+        XrResult res = nextXrEnumerateViewConfigurationViews(instance, systemId,
+                                                             viewConfigurationType, viewCapacityInput,
+                                                             viewCountOutput, views);
+        if (!enabled) {
+            return res;
+        }
+
+        if (res != XR_SUCCESS || views == nullptr) {
+            DebugLog("<-- fommil_widescreen_xrEnumerateViewConfigurationViews EARLY %d\n", res);
+            return res;
+        }
+
+        PFN_xrGetViewConfigurationProperties pfnGetProps = nullptr;
+        XrResult props_result = nextXrGetInstanceProcAddr(instance, "xrGetViewConfigurationProperties", reinterpret_cast<PFN_xrVoidFunction*>(&pfnGetProps));
+        if (props_result == XR_SUCCESS) {
+            DebugLog("  --> got props ref\n");
+            XrViewConfigurationProperties props{XR_TYPE_VIEW_CONFIGURATION_PROPERTIES};
+            if (pfnGetProps(instance, systemId, viewConfigurationType, &props) == XR_SUCCESS &&
+                props.fovMutable == XR_TRUE) {
+                DebugLog("  --> got props, and fovMutable is true\n");
+                for (uint32_t i = 0; i < *viewCountOutput; ++i) {
+                    const uint32_t w = views[i].recommendedImageRectWidth;
+                    const uint32_t h = views[i].recommendedImageRectHeight;
+                    const double curAspect = static_cast<double>(w) / static_cast<double>(h);
+                    DebugLog("  --> aspect for %u is %.3f", i, curAspect);
+                    if (curAspect > kTargetAspect)
+                        continue;
+                    const uint32_t newH = static_cast<uint32_t>(
+                                               std::lround(static_cast<double>(w) / kTargetAspect));
+                    DebugLog("  --> Res clamp: view %u  %ux%u → %ux%u (aspect %.3f)\n",
+                             i, w, h, w, newH, kTargetAspect);
+                    views[i].recommendedImageRectHeight = std::max<uint32_t>(1u, newH);
                 }
             }
-            configFile.close();
-
-            config.loaded = true;
-
-            return true;
         }
 
-        Log("Could not load config for \"%s\"\n", configName.c_str());
+        DebugLog("<-- fommil_widescreen_xrEnumerateViewConfigurationViews %d\n", res);
 
-        return false;
+        return res;
     }
 
     // Overrides the behavior of xrLocateViews().
-    XrResult FOVModifier_xrLocateViews(
+    XrResult fommil_widescreen_xrLocateViews(
         const XrSession session,
         const XrViewLocateInfo* const viewLocateInfo,
         XrViewState* const viewState,
@@ -187,66 +184,59 @@ namespace {
         uint32_t* const viewCountOutput,
         XrView* const views)
     {
-        DebugLog("--> FOVModifier_xrLocateViews\n");
-
-        // Call the chain to perform the actual operation.
-        const XrResult result = nextXrLocateViews(session, viewLocateInfo, viewState, viewCapacityInput, viewCountOutput, views);
-        if (result == XR_SUCCESS)
-        {
-            // Apply our logic to modify the FOV.
-            if (viewLocateInfo->viewConfigurationType == XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO)
-            {
-                views[0].fov.angleDown *= config.leftAngleDown;
-                views[0].fov.angleUp *= config.leftAngleUp;
-                views[0].fov.angleLeft *= config.leftAngleLeft;
-                views[0].fov.angleRight *= config.leftAngleRight;
-                views[1].fov.angleDown *= config.rightAngleDown;
-                views[1].fov.angleUp *= config.rightAngleUp;
-                views[1].fov.angleLeft *= config.rightAngleLeft;
-                views[1].fov.angleRight *= config.rightAngleRight;
-            }
+        if (enabled) {
+            DebugLog("--> fommil_widescreen_xrLocateViews\n");
         }
 
-        DebugLog("<-- FOVModifier_xrLocateViews %d\n", result);
+        // Call the chain to perform the actual operation.
+        XrResult result = nextXrLocateViews(session, viewLocateInfo, viewState, viewCapacityInput, viewCountOutput, views);
+        if (!enabled) {
+            return result;
+        }
+
+        if (result == XR_SUCCESS && viewLocateInfo->viewConfigurationType == XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO)
+        {
+            for (uint32_t i = 0; i < *viewCountOutput; ++i)
+                ClampVerticalFov(views[i].fov);
+        }
+
+        DebugLog("<-- fommil_widescreen_xrLocateViews %d\n", result);
 
         return result;
     }
 
     // Entry point for OpenXR calls.
-    XrResult FOVModifier_xrGetInstanceProcAddr(
+    XrResult fommil_widescreen_xrGetInstanceProcAddr(
         const XrInstance instance,
         const char* const name,
         PFN_xrVoidFunction* const function)
     {
-        DebugLog("--> FOVModifier_xrGetInstanceProcAddr \"%s\"\n", name);
+        DebugLog("--> fommil_widescreen_xrGetInstanceProcAddr \"%s\"\n", name);
+        XrResult res = nextXrGetInstanceProcAddr(instance, name, function);
 
-        // Call the chain to resolve the next function pointer.
-        const XrResult result = nextXrGetInstanceProcAddr(instance, name, function);
-        if (config.loaded && result == XR_SUCCESS)
-        {
-            const std::string apiName(name);
-
-            // Intercept the calls handled by our layer.
-            if (apiName == "xrLocateViews") {
-                nextXrLocateViews = reinterpret_cast<PFN_xrLocateViews>(*function);
-                *function = reinterpret_cast<PFN_xrVoidFunction>(FOVModifier_xrLocateViews);
-            }
-
-            // Leave all unhandled calls to the next layer.
+        if (strcmp(name, "xrLocateViews") == 0) {
+            nextXrLocateViews = reinterpret_cast<PFN_xrLocateViews>(*function);
+            *function = reinterpret_cast<PFN_xrVoidFunction>(
+                fommil_widescreen_xrLocateViews);
+        }
+        else if (strcmp(name, "xrEnumerateViewConfigurationViews") == 0) {
+            nextXrEnumerateViewConfigurationViews =
+                reinterpret_cast<PFN_xrEnumerateViewConfigurationViews>(*function);
+            *function = reinterpret_cast<PFN_xrVoidFunction>(
+                fommil_widescreen_xrEnumerateViewConfigurationViews);
         }
 
-        DebugLog("<-- FOVModifier_xrGetInstanceProcAddr %d\n", result);
-
-        return result;
+        DebugLog("<-- fommil_widescreen_xrGetInstanceProcAddr %d\n", res);
+        return res;
     }
 
     // Entry point for creating the layer.
-    XrResult FOVModifier_xrCreateApiLayerInstance(
+    XrResult fommil_widescreen_xrCreateApiLayerInstance(
         const XrInstanceCreateInfo* const instanceCreateInfo,
         const struct XrApiLayerCreateInfo* const apiLayerInfo,
         XrInstance* const instance)
     {
-        DebugLog("--> FOVModifier_xrCreateApiLayerInstance\n");
+        DebugLog("--> fommil_widescreen_xrCreateApiLayerInstance\n");
 
         if (!apiLayerInfo ||
             apiLayerInfo->structType != XR_LOADER_INTERFACE_STRUCT_API_LAYER_CREATE_INFO ||
@@ -271,17 +261,11 @@ namespace {
         XrApiLayerCreateInfo chainApiLayerInfo = *apiLayerInfo;
         chainApiLayerInfo.nextInfo = apiLayerInfo->nextInfo->next;
         const XrResult result = apiLayerInfo->nextInfo->nextCreateApiLayerInstance(instanceCreateInfo, &chainApiLayerInfo, instance);
-        if (result == XR_SUCCESS)
-        {
-            // Identify the application and load our configuration. Try by application first, then fallback to engines otherwise.
-            config.Reset();
-            if (!LoadConfiguration(instanceCreateInfo->applicationInfo.applicationName)) {
-                LoadConfiguration(instanceCreateInfo->applicationInfo.engineName);
-            }
-            config.Dump();
-        }
+        DebugLog("<-- fommil_widescreen_xrCreateApiLayerInstance %d\n", result);
 
-        DebugLog("<-- FOVModifier_xrCreateApiLayerInstance %d\n", result);
+        const char* appName = instanceCreateInfo->applicationInfo.applicationName;
+        enabled = std::strstr(appName, "iRacing") != nullptr;
+        Log("[widescreen] %s for \"%s\"\n", enabled ? "ENABLED" : "DISABLED", appName);
 
         return result;
     }
@@ -291,12 +275,12 @@ namespace {
 extern "C" {
 
     // Entry point for the loader.
-    XrResult __declspec(dllexport) XRAPI_CALL FOVModifier_xrNegotiateLoaderApiLayerInterface(
+    XrResult __declspec(dllexport) XRAPI_CALL fommil_widescreen_xrNegotiateLoaderApiLayerInterface(
         const XrNegotiateLoaderInfo* const loaderInfo,
         const char* const apiLayerName,
         XrNegotiateApiLayerRequest* const apiLayerRequest)
     {
-        DebugLog("--> (early) FOVModifier_xrNegotiateLoaderApiLayerInterface\n");
+        DebugLog("--> (early) fommil_widescreen_xrNegotiateLoaderApiLayerInterface\n");
 
         // Retrieve the path of the DLL.
         if (dllHome.empty())
@@ -312,18 +296,19 @@ extern "C" {
             {
                 // Falling back to loading config/writing logs to the current working directory.
                 DebugLog("Failed to locate DLL\n");
-            }            
+            }
         }
 
         // Start logging to file.
         if (!logStream.is_open())
         {
+            // std::string logFile = (std::filesystem::path(dllHome) / std::filesystem::path(LayerName + ".log")).string();
             std::string logFile = (std::filesystem::path(getenv("LOCALAPPDATA")) / std::filesystem::path(LayerName + ".log")).string();
             logStream.open(logFile, std::ios_base::ate);
             Log("dllHome is \"%s\"\n", dllHome.c_str());
         }
 
-        DebugLog("--> FOVModifier_xrNegotiateLoaderApiLayerInterface\n");
+        DebugLog("--> fommil_widescreen_xrNegotiateLoaderApiLayerInterface\n");
 
         if (apiLayerName && apiLayerName != LayerName)
         {
@@ -352,10 +337,10 @@ extern "C" {
         // Setup our layer to intercept OpenXR calls.
         apiLayerRequest->layerInterfaceVersion = XR_CURRENT_LOADER_API_LAYER_VERSION;
         apiLayerRequest->layerApiVersion = XR_CURRENT_API_VERSION;
-        apiLayerRequest->getInstanceProcAddr = reinterpret_cast<PFN_xrGetInstanceProcAddr>(FOVModifier_xrGetInstanceProcAddr);
-        apiLayerRequest->createApiLayerInstance = reinterpret_cast<PFN_xrCreateApiLayerInstance>(FOVModifier_xrCreateApiLayerInstance);
+        apiLayerRequest->getInstanceProcAddr = reinterpret_cast<PFN_xrGetInstanceProcAddr>(fommil_widescreen_xrGetInstanceProcAddr);
+        apiLayerRequest->createApiLayerInstance = reinterpret_cast<PFN_xrCreateApiLayerInstance>(fommil_widescreen_xrCreateApiLayerInstance);
 
-        DebugLog("<-- FOVModifier_xrNegotiateLoaderApiLayerInterface\n");
+        DebugLog("<-- fommil_widescreen_xrNegotiateLoaderApiLayerInterface\n");
 
         Log("%s layer is active\n", LayerName.c_str());
 
