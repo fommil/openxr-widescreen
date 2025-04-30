@@ -1,16 +1,25 @@
 # OpenXR Widescreen
 
-This is an OpenXR layer that crops the field of view to the widescreen aspect ratio. Effectively disabling rendering of the top and bottom of the viewport. This reduces the computational overhead, which is especially useful for simracing where that region would be obscured by a helmet. It has only been tested with a BigScreenBeyond, and is only enabled for iRacing.
+This is an OpenXR layer that crops the field of view to the widescreen aspect ratio. Effectively disabling rendering of the top and bottom of the viewport. This reduces the computational overhead, which is especially useful for simracing where that region would be obscured by a helmet.
+
+It has only been tested with a [BigScreenBeyond](https://www.bigscreenvr.com/), and is only enabled for iRacing. Using HWINFO I see a typical drop in GPU usage down from 50% to 30% when this layer is enabled, which I find to be a good base giving me overhead for full grids and rain.
 
 This is forked from an archived exemplar by Matthieu Bucchianeri (the author of OpenXR-Toolkit), who helped me out.
-
-Caveat emptor: I'm not really sure if this is doing what it is supposed to be doing. The overrides for the `xrEnumerateViewConfigurationViews` function never seem to trigger, and it's possible it is just squashing the vertical rather than cropping. One thing I can be sure of is that it reduces the GPU overhead for me by about 33%, so *something* is working.
 
 If enough people use this and donate, I might buy a digital certificate to sign it and keep all the virus checkers and anti-cheat systems happy. Until then, users have to manually tell Windows that it's safe to download and install.
 
 [![buy me a coffee](https://cdn.buymeacoffee.com/buttons/default-orange.png)](https://www.buymeacoffee.com/fommil)
 
 ... pssst! I've contributed a lot of code to [CrewChief](https://thecrewchief.org/)
+
+## Customise
+
+Create a file in `~/AppData/XR_APILAYER_fommil_widescreen.ini` containing an alternative target aspect ratio:
+
+```
+[Settings]
+aspect = 2.0 # more like ultra-wide
+```
 
 ## Developers
 

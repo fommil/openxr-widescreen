@@ -13,8 +13,12 @@
 // limitations under the License.
 
 #include "pch.h"
+#include <array>
 #include <algorithm>
 #include <cmath>
+#include <filesystem>
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
 
 namespace {
     const std::string LayerName = "XR_APILAYER_fommil_widescreen";
@@ -24,14 +28,15 @@ namespace {
     std::ofstream logStream;
 
     // we only enable ourselves for specific (simracing) titles
-    // this has to be considered for every function, because
-    // downstream of us might cache references.
+    const std::array<const char*, 1> allowedApps = {
+        "iRacingSim64DX11"
+    };
+    // has to be checked on every call, because downstream can cache pointers
     bool enabled = false;
 
-    // we might want to make this configurable in the future
-    constexpr double kTargetAspect = 16.0f / 9.0f;
+    // this is the fallback after reading the config file
+    double targetAspect = 16.0f / 9.0f;
 
-    // Function pointers to interact with the next layers and/or the OpenXR runtime.
     PFN_xrGetInstanceProcAddr nextXrGetInstanceProcAddr = nullptr;
     PFN_xrLocateViews nextXrLocateViews = nullptr;
     PFN_xrEnumerateViewConfigurationViews nextXrEnumerateViewConfigurationViews = nullptr;
@@ -68,13 +73,6 @@ namespace {
 #endif
     }
 
-    // ---------------------------------------------------------------------------
-    // ClampVerticalFov – symmetric 16:9 crop (equal cut top & bottom)
-    // ---------------------------------------------------------------------------
-    // - works entirely in double precision to minimise rounding
-    // - first tries an equal-delta trim; if either side can’t spare the delta
-    //   it falls back to proportional scaling (rare on real headsets)
-    // ---------------------------------------------------------------------------
     static void ClampVerticalFov(XrFovf& fov)
     {
         using d = double;
@@ -88,40 +86,24 @@ namespace {
         d heightTan = std::fabs(tanU) + std::fabs(tanD);
         d aspect = widthTan / heightTan;
 
-        if (aspect >= kTargetAspect)
+        if (aspect >= targetAspect)
             return;
 
-        d desiredHeightTan = widthTan / kTargetAspect;
+        d desiredHeightTan = widthTan / targetAspect;
         d delta = (heightTan - desiredHeightTan) * 0.5;  // cut from each side
-
-        // Can both sides spare that much?
         d maxTrim = std::fabs(tanU) < std::fabs(tanD) ? std::fabs(tanU) : std::fabs(tanD);
 
-        if (delta <= maxTrim)
-        {
-            tanU -= delta;
-            tanD += delta;
-        }
-        else
-        {
-            d scale = desiredHeightTan / heightTan;
-            tanU *= scale;
-            tanD *= scale;
-            delta = 0.0;
-        }
+        if (delta >= maxTrim)
+            return;
 
-        // Back to angles (single float conversion)
-        fov.angleUp = static_cast<float>(std::atan(tanU));
-        fov.angleDown = static_cast<float>(std::atan(tanD));
-
-#ifdef _DEBUG
-        d newAspect = widthTan / (std::fabs(tanU) + std::fabs(tanD));
-        DebugLog("FOV sym-crop: aspect %.6f → %.6f  delta %.6f%s\n",
-            aspect, newAspect, delta,
-            delta == 0.0 ? " (scaled)" : "");
-#endif
+        fov.angleUp = static_cast<float>(std::atan(tanU - delta));
+        fov.angleDown = static_cast<float>(std::atan(tanD + delta));
     }
 
+    // NOTE: this doesn't seem to ever be called by iRacing. Presumably they do their
+    // own calculation of the view configuration, but whatever way it works it does
+    // seem to work to only override xrLocateViews. This code is left incase it is
+    // required on other titles but is completely untested.
     XRAPI_ATTR XrResult XRAPI_CALL fommil_widescreen_xrEnumerateViewConfigurationViews(
         XrInstance               instance,
         XrSystemId               systemId,
@@ -158,13 +140,13 @@ namespace {
                     const uint32_t w = views[i].recommendedImageRectWidth;
                     const uint32_t h = views[i].recommendedImageRectHeight;
                     const double curAspect = static_cast<double>(w) / static_cast<double>(h);
-                    DebugLog("  --> aspect for %u is %.3f", i, curAspect);
-                    if (curAspect > kTargetAspect)
+                    DebugLog("  --> aspect for %u is %.3f\n", i, curAspect);
+                    if (curAspect > targetAspect)
                         continue;
                     const uint32_t newH = static_cast<uint32_t>(
-                                               std::lround(static_cast<double>(w) / kTargetAspect));
+                                               std::lround(static_cast<double>(w) / targetAspect));
                     DebugLog("  --> Res clamp: view %u  %ux%u → %ux%u (aspect %.3f)\n",
-                             i, w, h, w, newH, kTargetAspect);
+                             i, w, h, w, newH, targetAspect);
                     views[i].recommendedImageRectHeight = std::max<uint32_t>(1u, newH);
                 }
             }
@@ -175,7 +157,6 @@ namespace {
         return res;
     }
 
-    // Overrides the behavior of xrLocateViews().
     XrResult fommil_widescreen_xrLocateViews(
         const XrSession session,
         const XrViewLocateInfo* const viewLocateInfo,
@@ -188,7 +169,6 @@ namespace {
             DebugLog("--> fommil_widescreen_xrLocateViews\n");
         }
 
-        // Call the chain to perform the actual operation.
         XrResult result = nextXrLocateViews(session, viewLocateInfo, viewState, viewCapacityInput, viewCountOutput, views);
         if (!enabled) {
             return result;
@@ -205,7 +185,6 @@ namespace {
         return result;
     }
 
-    // Entry point for OpenXR calls.
     XrResult fommil_widescreen_xrGetInstanceProcAddr(
         const XrInstance instance,
         const char* const name,
@@ -230,7 +209,6 @@ namespace {
         return res;
     }
 
-    // Entry point for creating the layer.
     XrResult fommil_widescreen_xrCreateApiLayerInstance(
         const XrInstanceCreateInfo* const instanceCreateInfo,
         const struct XrApiLayerCreateInfo* const apiLayerInfo,
@@ -261,12 +239,17 @@ namespace {
         XrApiLayerCreateInfo chainApiLayerInfo = *apiLayerInfo;
         chainApiLayerInfo.nextInfo = apiLayerInfo->nextInfo->next;
         const XrResult result = apiLayerInfo->nextInfo->nextCreateApiLayerInstance(instanceCreateInfo, &chainApiLayerInfo, instance);
-        DebugLog("<-- fommil_widescreen_xrCreateApiLayerInstance %d\n", result);
 
         const char* appName = instanceCreateInfo->applicationInfo.applicationName;
-        enabled = std::strstr(appName, "iRacing") != nullptr;
-        Log("[widescreen] %s for \"%s\"\n", enabled ? "ENABLED" : "DISABLED", appName);
+        for (const auto& allowed : allowedApps) {
+            if (std::strstr(appName, allowed)) {
+                enabled = true;
+                break;
+            }
+        }
+        Log("%s for \"%s\"\n", enabled ? "ENABLED" : "DISABLED", appName);
 
+        DebugLog("<-- fommil_widescreen_xrCreateApiLayerInstance %d\n", result);
         return result;
     }
 
@@ -274,7 +257,7 @@ namespace {
 
 extern "C" {
 
-    // Entry point for the loader.
+    // entry point for the loader
     XrResult __declspec(dllexport) XRAPI_CALL fommil_widescreen_xrNegotiateLoaderApiLayerInterface(
         const XrNegotiateLoaderInfo* const loaderInfo,
         const char* const apiLayerName,
@@ -282,7 +265,6 @@ extern "C" {
     {
         DebugLog("--> (early) fommil_widescreen_xrNegotiateLoaderApiLayerInterface\n");
 
-        // Retrieve the path of the DLL.
         if (dllHome.empty())
         {
             HMODULE module;
@@ -294,12 +276,10 @@ extern "C" {
             }
             else
             {
-                // Falling back to loading config/writing logs to the current working directory.
                 DebugLog("Failed to locate DLL\n");
             }
         }
 
-        // Start logging to file.
         if (!logStream.is_open())
         {
             // std::string logFile = (std::filesystem::path(dllHome) / std::filesystem::path(LayerName + ".log")).string();
@@ -307,6 +287,17 @@ extern "C" {
             logStream.open(logFile, std::ios_base::ate);
             Log("dllHome is \"%s\"\n", dllHome.c_str());
         }
+
+        std::filesystem::path config = std::filesystem::path(getenv("LOCALAPPDATA")) / std::filesystem::path(LayerName + ".ini");
+        if (std::filesystem::exists(config)) {
+            wchar_t buffer[64];
+            GetPrivateProfileStringW(L"Settings", L"aspect", L"", buffer, 64, config.c_str());
+            double aspect = std::stod(buffer);
+            if (aspect >= 1 && aspect <= 3) {
+                targetAspect = aspect;
+            }
+        }
+        Log("target aspect is %f\n", targetAspect);
 
         DebugLog("--> fommil_widescreen_xrNegotiateLoaderApiLayerInterface\n");
 
@@ -334,7 +325,6 @@ extern "C" {
             return XR_ERROR_INITIALIZATION_FAILED;
         }
 
-        // Setup our layer to intercept OpenXR calls.
         apiLayerRequest->layerInterfaceVersion = XR_CURRENT_LOADER_API_LAYER_VERSION;
         apiLayerRequest->layerApiVersion = XR_CURRENT_API_VERSION;
         apiLayerRequest->getInstanceProcAddr = reinterpret_cast<PFN_xrGetInstanceProcAddr>(fommil_widescreen_xrGetInstanceProcAddr);
