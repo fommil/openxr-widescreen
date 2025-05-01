@@ -1,10 +1,9 @@
 <?xml version="1.0" encoding="utf-8"?>
 <Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
-  <Product Id="*" Name="OpenXR Widescreen Layer"
-           Language="1033" Version="1.0.0"
+  <Product Id="55D4A48D-986D-46FC-8CFA-1C338A064989" Name="OpenXR Widescreen Layer"
+           Language="1033" Version="1.0.1"
            Manufacturer="fommil"
            UpgradeCode="0490F452-3EA7-4478-9372-EAE4D32C3666">
-
     <Package InstallerVersion="500" Compressed="yes" InstallScope="perMachine" Platform="x64" />
 
     <MediaTemplate EmbedCab="yes" />
