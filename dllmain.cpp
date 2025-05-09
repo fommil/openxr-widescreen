@@ -20,6 +20,11 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 
+#ifdef _DEBUG
+#include <random>
+#include <sstream>
+#endif
+
 namespace {
     const std::string LayerName = "XR_APILAYER_fommil_widescreen";
 
@@ -100,10 +105,6 @@ namespace {
         fov.angleDown = static_cast<float>(std::atan(tanD + delta));
     }
 
-    // NOTE: this doesn't seem to ever be called by iRacing. Presumably they do their
-    // own calculation of the view configuration, but whatever way it works it does
-    // seem to work to only override xrLocateViews. This code is left incase it is
-    // required on other titles but is completely untested.
     XRAPI_ATTR XrResult XRAPI_CALL fommil_widescreen_xrEnumerateViewConfigurationViews(
         XrInstance               instance,
         XrSystemId               systemId,
@@ -282,8 +283,18 @@ extern "C" {
 
         if (!logStream.is_open())
         {
-            // std::string logFile = (std::filesystem::path(dllHome) / std::filesystem::path(LayerName + ".log")).string();
+            // some titles (e.g. iRacing) start multiple instances which means our logs get over-written.
+            // since we only really care about preserving the earlier logs in debug builds, we just create
+            // a fresh log for every instance in that case.
+#ifdef _DEBUG
+            std::mt19937 rng{ std::random_device{}() };
+            std::uniform_int_distribution<uint32_t> dist;
+            std::stringstream ss;
+            ss << LayerName << "_" << std::hex << dist(rng) << ".log";
+            std::string logFile = (std::filesystem::path(getenv("LOCALAPPDATA")) / ss.str()).string();
+#else
             std::string logFile = (std::filesystem::path(getenv("LOCALAPPDATA")) / std::filesystem::path(LayerName + ".log")).string();
+#endif
             logStream.open(logFile, std::ios_base::ate);
             Log("dllHome is \"%s\"\n", dllHome.c_str());
         }
